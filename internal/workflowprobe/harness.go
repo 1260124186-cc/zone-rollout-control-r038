@@ -14,6 +14,7 @@ import (
 
 	"solo-0014-zone-rollout-control/internal/allocation"
 	"solo-0014-zone-rollout-control/internal/assessment"
+	"solo-0014-zone-rollout-control/internal/domain"
 	"solo-0014-zone-rollout-control/internal/fleet"
 	"solo-0014-zone-rollout-control/internal/httpapi"
 	"solo-0014-zone-rollout-control/internal/plan"
@@ -23,12 +24,13 @@ import (
 )
 
 type harness struct {
-	baseURL  string
-	clock    *platform.ManualClock
-	client   *http.Client
-	server   *http.Server
-	listener net.Listener
-	tempDir  string
+	baseURL   string
+	statePath string
+	clock     *platform.ManualClock
+	client    *http.Client
+	server    *http.Server
+	listener  net.Listener
+	tempDir   string
 }
 
 func newHarness() (*harness, error) {
@@ -36,7 +38,31 @@ func newHarness() (*harness, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create temporary directory: %w", err)
 	}
-	stateStore, err := store.Open(tempDir + "/state.json")
+	return newHarnessWithState(tempDir, tempDir+"/state.json")
+}
+
+// newHarnessFromSnapshot boots a harness over a pre-written snapshot file,
+// which is how upgrade/restart recovery is exercised.
+func newHarnessFromSnapshot(state domain.State) (*harness, error) {
+	tempDir, err := os.MkdirTemp("", "zrc-probe-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temporary directory: %w", err)
+	}
+	statePath := tempDir + "/state.json"
+	payload, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		_ = os.RemoveAll(tempDir)
+		return nil, fmt.Errorf("encode legacy snapshot: %w", err)
+	}
+	if err := os.WriteFile(statePath, payload, 0o600); err != nil {
+		_ = os.RemoveAll(tempDir)
+		return nil, fmt.Errorf("write legacy snapshot: %w", err)
+	}
+	return newHarnessWithState(tempDir, statePath)
+}
+
+func newHarnessWithState(tempDir, statePath string) (*harness, error) {
+	stateStore, err := store.Open(statePath)
 	if err != nil {
 		_ = os.RemoveAll(tempDir)
 		return nil, fmt.Errorf("open temporary store: %w", err)
@@ -61,13 +87,51 @@ func newHarness() (*harness, error) {
 		_ = server.Serve(listener)
 	}()
 	return &harness{
-		baseURL:  "http://" + listener.Addr().String(),
-		clock:    clock,
-		client:   &http.Client{Timeout: 10 * time.Second},
-		server:   server,
-		listener: listener,
-		tempDir:  tempDir,
+		baseURL:   "http://" + listener.Addr().String(),
+		statePath: statePath,
+		clock:     clock,
+		client:    &http.Client{Timeout: 10 * time.Second},
+		server:    server,
+		listener:  listener,
+		tempDir:   tempDir,
 	}, nil
+}
+
+// restart shuts the server down and boots a fresh process view over the same
+// snapshot, exercising real load-time normalization and recovery.
+func (h *harness) restart() error {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := h.server.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown server: %w", err)
+	}
+	_ = h.listener.Close()
+
+	stateStore, err := store.Open(h.statePath)
+	if err != nil {
+		return fmt.Errorf("reopen store: %w", err)
+	}
+	ids := platform.CryptoIDGenerator{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	plans := plan.New(stateStore, h.clock, ids)
+	nodes := fleet.New(stateStore, h.clock, ids)
+	allocations := allocation.New(stateStore, h.clock, ids)
+	probes := probe.New(stateStore, h.clock, ids, allocations)
+	assessments := assessment.New(stateStore, h.clock, ids)
+	api := httpapi.New(plans, nodes, allocations, probes, assessments, ids, logger)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("listen after restart: %w", err)
+	}
+	server := &http.Server{Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	h.baseURL = "http://" + listener.Addr().String()
+	h.server = server
+	h.listener = listener
+	return nil
 }
 
 func (h *harness) close() {

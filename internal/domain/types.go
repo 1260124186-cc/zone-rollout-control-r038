@@ -119,6 +119,10 @@ type Probe struct {
 	PayloadFingerprint string    `json:"payload_fingerprint"`
 }
 
+// ProbeRequestClaim is a legacy shape. Retry keys used to be global and probes
+// submitted by other leases sharing a key were stored only as ledger claims.
+// It is retained so old snapshots can be decoded; reconciliation promotes the
+// shadow probes into State.Probes and drops the claims on the next write.
 type ProbeRequestClaim struct {
 	LeaseID string `json:"lease_id"`
 	PlanID  string `json:"plan_id"`
@@ -126,6 +130,9 @@ type ProbeRequestClaim struct {
 	Probe   Probe  `json:"probe"`
 }
 
+// ProbeRequestEntry records the first probe for a (lease, request key) pair.
+// Retry keys are scoped to a single lease: two leases may reuse the same key
+// without ever sharing an entry.
 type ProbeRequestEntry struct {
 	RequestKey         string              `json:"request_key"`
 	ContentFingerprint string              `json:"content_fingerprint"`

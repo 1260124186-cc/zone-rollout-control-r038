@@ -67,8 +67,16 @@ func ProbeFingerprint(leaseID string, input ProbeInput) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func ProbeRequestLedgerKey(input ProbeInput) string {
-	return input.RequestKey
+// ProbeRequestLedgerKey scopes a submitted request key to the lease it is
+// being submitted to. The same request key on a different lease produces a
+// distinct idempotency bucket.
+func ProbeRequestLedgerKey(leaseID string, input ProbeInput) string {
+	return ProbeLedgerKey(leaseID, input.RequestKey)
+}
+
+// ProbeLedgerKey identifies the idempotency bucket for a single lease.
+func ProbeLedgerKey(leaseID string, requestKey string) string {
+	return leaseID + "\x00" + requestKey
 }
 
 func ProbeContentFingerprint(input ProbeInput) string {
@@ -106,6 +114,25 @@ func probeContentFingerprint(
 	return hex.EncodeToString(sum[:])
 }
 
+// EnsureProbeRequestLedger recovers probe-to-lease bindings from facts after
+// an upgrade or restart.
+//
+// Historically the probe retry ledger was keyed only by request key. Two
+// leases reusing the same key could end up sharing an entry: the later lease
+// was marked reported with ProbeID pointing at the first lease's probe while
+// its own observation was parked as a ledger claim and absent from Probes.
+//
+// Reconciliation makes the stored facts authoritative:
+//
+//  1. Every shadow probe parked in legacy ledger claims is promoted into
+//     State.Probes (filling in missing lease/plan/node identity first).
+//  2. Each reported lease is rebound to a probe that actually belongs to it;
+//     a lease whose probe belongs to another lease loses the foreign binding.
+//  3. The ledger is rebuilt as strictly per-(lease, request key) entries from
+//     the probes themselves, so a retry key can only ever denote a retry
+//     inside its own lease.
+//
+// The function is idempotent and deterministic.
 func EnsureProbeRequestLedger(state *State) {
 	if state == nil {
 		return
@@ -113,48 +140,139 @@ func EnsureProbeRequestLedger(state *State) {
 	if state.ProbeRequestLedger == nil {
 		state.ProbeRequestLedger = make(map[string]ProbeRequestEntry)
 	}
-
-	claims := make(map[string]struct{})
-	for requestKey, entry := range state.ProbeRequestLedger {
-		entry.RequestKey = requestKey
-		for index := range entry.Claims {
-			claim := entry.Claims[index]
-			if claim.LeaseID == "" {
-				claim.LeaseID = claim.Probe.LeaseID
-			}
-			if claim.PlanID == "" {
-				claim.PlanID = claim.Probe.PlanID
-			}
-			if claim.NodeID == "" {
-				claim.NodeID = claim.Probe.NodeID
-			}
-			if claim.Probe.RequestKey == "" {
-				claim.Probe.RequestKey = requestKey
-			}
-			entry.Claims[index] = claim
-			claims[probeClaimKey(claim.LeaseID, claim.Probe.ID)] = struct{}{}
-		}
-		if entry.PrimaryProbeID != "" {
-			primary, ok := state.Probes[entry.PrimaryProbeID]
-			if ok {
-				claimKey := probeClaimKey(primary.LeaseID, primary.ID)
-				if _, exists := claims[claimKey]; !exists {
-					entry.Claims = append(entry.Claims, ProbeRequestClaim{
-						LeaseID: primary.LeaseID,
-						PlanID:  primary.PlanID,
-						NodeID:  primary.NodeID,
-						Probe:   primary,
-					})
-					claims[claimKey] = struct{}{}
-				}
-				if entry.ContentFingerprint == "" {
-					entry.ContentFingerprint = ProbeContentFingerprintForProbe(primary)
-				}
-			}
-		}
-		state.ProbeRequestLedger[requestKey] = entry
+	if state.Probes == nil {
+		state.Probes = make(map[string]Probe)
 	}
 
+	promoteLegacyClaimProbes(state)
+	repairLeaseProbeBindings(state)
+	rebuildProbeLedger(state)
+}
+
+// promoteLegacyClaimProbes moves probes that were stored only inside global
+// ledger claims into State.Probes so no real observation is hidden from lease
+// state or from consistency assessment.
+func promoteLegacyClaimProbes(state *State) {
+	for _, entry := range state.ProbeRequestLedger {
+		for _, claim := range entry.Claims {
+			probe := claim.Probe
+			if probe.ID == "" {
+				continue
+			}
+			if probe.LeaseID == "" {
+				probe.LeaseID = claim.LeaseID
+			}
+			if probe.PlanID == "" {
+				probe.PlanID = claim.PlanID
+				if lease, ok := state.Leases[probe.LeaseID]; ok {
+					probe.PlanID = lease.PlanID
+				}
+			}
+			if probe.NodeID == "" {
+				probe.NodeID = claim.NodeID
+				if lease, ok := state.Leases[probe.LeaseID]; ok {
+					probe.NodeID = lease.NodeID
+				}
+			}
+			if probe.RequestKey == "" {
+				probe.RequestKey = entry.RequestKey
+			}
+			existing, exists := state.Probes[probe.ID]
+			if !exists {
+				state.Probes[probe.ID] = probe
+				continue
+			}
+			if existing.LeaseID == "" && probe.LeaseID != "" {
+				existing.LeaseID = probe.LeaseID
+			}
+			if existing.PlanID == "" && probe.PlanID != "" {
+				existing.PlanID = probe.PlanID
+			}
+			if existing.NodeID == "" && probe.NodeID != "" {
+				existing.NodeID = probe.NodeID
+			}
+			if existing.RequestKey == "" && probe.RequestKey != "" {
+				existing.RequestKey = probe.RequestKey
+			}
+			state.Probes[probe.ID] = existing
+		}
+	}
+}
+
+// repairLeaseProbeBindings ensures every lease points at a probe that
+// genuinely belongs to it. Leases that were bound to another lease's probe
+// are rebound to their own promoted probe; leases with no surviving
+// observation fall back to claimed and their node is marked leased again.
+func repairLeaseProbeBindings(state *State) {
+	probesByLease := make(map[string][]Probe)
+	for _, probe := range state.Probes {
+		probesByLease[probe.LeaseID] = append(probesByLease[probe.LeaseID], probe)
+	}
+	for leaseID := range probesByLease {
+		sort.Slice(probesByLease[leaseID], func(i, j int) bool {
+			left, right := probesByLease[leaseID][i], probesByLease[leaseID][j]
+			if !left.StoredAt.Equal(right.StoredAt) {
+				return left.StoredAt.Before(right.StoredAt)
+			}
+			return left.ID < right.ID
+		})
+	}
+
+	for leaseID, lease := range state.Leases {
+		if own := probesByLease[leaseID]; len(own) > 0 {
+			ownProbe := own[0]
+			if lease.ProbeID != ownProbe.ID || lease.State != LeaseReported {
+				lease.ProbeID = ownProbe.ID
+				lease.State = LeaseReported
+				finishedAt := ownProbe.StoredAt.UTC()
+				lease.FinishedAt = &finishedAt
+				state.Leases[leaseID] = lease
+			}
+			continue
+		}
+
+		// No probe belongs to this lease. A ProbeID pointing at a probe owned
+		// by another lease is the legacy misbinding: clear it and reopen the
+		// lease so its node can be observed for real.
+		if lease.ProbeID != "" {
+			if primary, ok := state.Probes[lease.ProbeID]; !ok || primary.LeaseID != leaseID {
+				lease.ProbeID = ""
+				lease.FinishedAt = nil
+				lease.State = LeaseClaimed
+				state.Leases[leaseID] = lease
+				reopenNodeForLease(state, lease)
+			}
+		}
+	}
+}
+
+// reopenNodeForLease marks the node backing a reopened lease as leased again
+// unless the node already has another active (claimed) lease, in which case it
+// must stay tied to that lease.
+func reopenNodeForLease(state *State, lease NodeLease) {
+	node, ok := state.Nodes[lease.NodeID]
+	if !ok {
+		return
+	}
+	for otherID, other := range state.Leases {
+		if otherID == lease.ID || other.NodeID != lease.NodeID {
+			continue
+		}
+		if other.State == LeaseClaimed {
+			return
+		}
+	}
+	if node.State == NodeReady {
+		node.State = NodeLeased
+		node.Version++
+		node.UpdatedAt = lease.ClaimedAt.UTC()
+		state.Nodes[node.ID] = node
+	}
+}
+
+// rebuildProbeLedger derives the per-(lease, request key) ledger solely from
+// the probes, dropping any global legacy interpretation.
+func rebuildProbeLedger(state *State) {
 	probes := make([]Probe, 0, len(state.Probes))
 	for _, probe := range state.Probes {
 		probes = append(probes, probe)
@@ -165,35 +283,23 @@ func EnsureProbeRequestLedger(state *State) {
 		}
 		return probes[i].ID < probes[j].ID
 	})
+
+	ledger := make(map[string]ProbeRequestEntry)
 	for _, probe := range probes {
-		requestKey := probe.RequestKey
-		if requestKey == "" {
+		if probe.RequestKey == "" {
 			continue
 		}
-		entry := state.ProbeRequestLedger[requestKey]
-		entry.RequestKey = requestKey
-		if entry.PrimaryProbeID == "" {
-			entry.PrimaryProbeID = probe.ID
+		key := ProbeLedgerKey(probe.LeaseID, probe.RequestKey)
+		if _, exists := ledger[key]; exists {
+			continue
 		}
-		if entry.ContentFingerprint == "" {
-			entry.ContentFingerprint = ProbeContentFingerprintForProbe(probe)
+		ledger[key] = ProbeRequestEntry{
+			RequestKey:         probe.RequestKey,
+			ContentFingerprint: ProbeContentFingerprintForProbe(probe),
+			PrimaryProbeID:     probe.ID,
 		}
-		claimKey := probeClaimKey(probe.LeaseID, probe.ID)
-		if _, exists := claims[claimKey]; !exists {
-			entry.Claims = append(entry.Claims, ProbeRequestClaim{
-				LeaseID: probe.LeaseID,
-				PlanID:  probe.PlanID,
-				NodeID:  probe.NodeID,
-				Probe:   probe,
-			})
-			claims[claimKey] = struct{}{}
-		}
-		state.ProbeRequestLedger[requestKey] = entry
 	}
-}
-
-func probeClaimKey(leaseID string, probeID string) string {
-	return leaseID + "\x00" + probeID
+	state.ProbeRequestLedger = ledger
 }
 
 func BuildAssessment(

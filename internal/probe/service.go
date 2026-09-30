@@ -2,7 +2,6 @@ package probe
 
 import (
 	"context"
-	"time"
 
 	"solo-0014-zone-rollout-control/internal/domain"
 	"solo-0014-zone-rollout-control/internal/platform"
@@ -43,13 +42,19 @@ func (s *Service) Submit(
 	}
 	fingerprint := domain.ProbeFingerprint(leaseID, input)
 	contentFingerprint := domain.ProbeContentFingerprint(input)
-	ledgerKey := domain.ProbeRequestLedgerKey(input)
+	// Retry keys are scoped to the lease: the same request key on another
+	// lease is an independent submission and must never be replayed here.
+	ledgerKey := domain.ProbeRequestLedgerKey(leaseID, input)
 	var result domain.Probe
 	err := s.store.Write(ctx, func(state *domain.State) error {
 		lease, ok := state.Leases[leaseID]
 		if !ok {
 			return domain.NotFound("lease", leaseID)
 		}
+
+		// Same lease, same request key: replay the first probe when the
+		// content matches, reject on differing content. No other lease is
+		// ever consulted.
 		if entry, exists := state.ProbeRequestLedger[ledgerKey]; exists &&
 			entry.PrimaryProbeID != "" {
 			primary, found := state.Probes[entry.PrimaryProbeID]
@@ -58,6 +63,17 @@ func (s *Service) Submit(
 					domain.CodeStorageFailure,
 					"probe request entry references a missing probe",
 					map[string]any{"probe_id": entry.PrimaryProbeID},
+				)
+			}
+			if primary.LeaseID != leaseID {
+				return domain.NewError(
+					domain.CodeStorageFailure,
+					"probe request entry is bound to another lease",
+					map[string]any{
+						"lease_id":       leaseID,
+						"bound_lease_id": primary.LeaseID,
+						"request_key":    input.RequestKey,
+					},
 				)
 			}
 			if entry.ContentFingerprint != contentFingerprint {
@@ -71,100 +87,21 @@ func (s *Service) Submit(
 				)
 			}
 			result = primary
-			if primary.LeaseID != leaseID {
-				if lease.State == domain.LeaseReported && lease.ProbeID == primary.ID {
-					return nil
-				}
-				if lease.State != domain.LeaseClaimed {
-					return domain.NewError(
-						domain.CodeLeaseNotClaimed,
-						"lease is not claimed",
-						map[string]any{
-							"lease_id": leaseID,
-							"state":    lease.State,
-						},
-					)
-				}
-				if !now.Before(lease.ExpiresAt) {
-					return domain.NewError(
-						domain.CodeLeaseExpired,
-						"lease has expired",
-						map[string]any{
-							"lease_id":   leaseID,
-							"expires_at": lease.ExpiresAt,
-						},
-					)
-				}
-				if plan, ok := state.Plans[lease.PlanID]; !ok {
-					return domain.NewError(
-						domain.CodeStorageFailure,
-						"lease references a missing plan",
-						map[string]any{"plan_id": lease.PlanID},
-					)
-				} else if plan.State != domain.PlanActive {
-					return domain.InvalidState(
-						"plan must be active to store probes",
-						map[string]any{
-							"plan_id": plan.ID,
-							"state":   plan.State,
-						},
-					)
-				}
-				if _, ok := state.Nodes[lease.NodeID]; !ok {
-					return domain.NewError(
-						domain.CodeStorageFailure,
-						"lease references a missing node",
-						map[string]any{"node_id": lease.NodeID},
-					)
-				}
-				claimProbe := domain.Probe{
-					ID:                 s.ids.New("prb"),
-					LeaseID:            leaseID,
-					PlanID:             lease.PlanID,
-					NodeID:             lease.NodeID,
-					RequestKey:         input.RequestKey,
-					Success:            input.Success,
-					ObservedSerial:     input.ObservedSerial,
-					LatencyMS:          input.LatencyMS,
-					ObservedAt:         input.ObservedAt.UTC(),
-					StoredAt:           now,
-					PayloadFingerprint: fingerprint,
-				}
-				entry.Claims = append(entry.Claims, domain.ProbeRequestClaim{
-					LeaseID: leaseID,
-					PlanID:  lease.PlanID,
-					NodeID:  lease.NodeID,
-					Probe:   claimProbe,
-				})
-				state.ProbeRequestLedger[ledgerKey] = entry
-				lease.State = domain.LeaseReported
-				finishedAt := now
-				lease.FinishedAt = &finishedAt
-				lease.ProbeID = primary.ID
-				state.Leases[leaseID] = lease
-				if node, ok := state.Nodes[lease.NodeID]; ok {
-					if node.State == domain.NodeLeased {
-						node.State = domain.NodeReady
-						node.Version++
-						node.UpdatedAt = now
-						state.Nodes[node.ID] = node
-					}
-				}
-				store.AddAudit(state, s.ids, "probe", result.ID, "replayed", now, map[string]any{
-					"lease_id":          leaseID,
-					"plan_id":           lease.PlanID,
-					"shadow_probe_id":   claimProbe.ID,
-					"request_key_scope": input.RequestKey,
-				})
-				return nil
-			}
 			return nil
 		}
+
 		if lease.State == domain.LeaseReported && lease.ProbeID != "" {
 			existing, found := state.Probes[lease.ProbeID]
 			if !found {
 				return domain.NewError(domain.CodeStorageFailure, "lease references a missing probe", map[string]any{
 					"probe_id": lease.ProbeID,
+				})
+			}
+			if existing.LeaseID != leaseID {
+				return domain.NewError(domain.CodeStorageFailure, "lease references a probe owned by another lease", map[string]any{
+					"lease_id":       leaseID,
+					"probe_id":       lease.ProbeID,
+					"probe_lease_id": existing.LeaseID,
 				})
 			}
 			if existing.PayloadFingerprint != fingerprint {
@@ -176,6 +113,7 @@ func (s *Service) Submit(
 			result = existing
 			return nil
 		}
+
 		if lease.State != domain.LeaseClaimed {
 			return domain.NewError(domain.CodeLeaseNotClaimed, "lease is not claimed", map[string]any{
 				"lease_id": leaseID,
@@ -206,6 +144,9 @@ func (s *Service) Submit(
 				"node_id": lease.NodeID,
 			})
 		}
+
+		// First probe for this (lease, request key): persist it as a
+		// first-class probe bound to this lease and node.
 		result = domain.Probe{
 			ID:                 s.ids.New("prb"),
 			LeaseID:            leaseID,
@@ -224,14 +165,6 @@ func (s *Service) Submit(
 			RequestKey:         input.RequestKey,
 			ContentFingerprint: contentFingerprint,
 			PrimaryProbeID:     result.ID,
-			Claims: []domain.ProbeRequestClaim{
-				{
-					LeaseID: leaseID,
-					PlanID:  lease.PlanID,
-					NodeID:  lease.NodeID,
-					Probe:   result,
-				},
-			},
 		}
 		lease.State = domain.LeaseReported
 		finishedAt := now
@@ -251,8 +184,4 @@ func (s *Service) Submit(
 		return nil
 	})
 	return result, err
-}
-
-func pointer(value time.Time) *time.Time {
-	return &value
 }
