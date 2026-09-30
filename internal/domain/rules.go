@@ -67,8 +67,12 @@ func ProbeFingerprint(leaseID string, input ProbeInput) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func ProbeRequestLedgerKey(input ProbeInput) string {
-	return input.RequestKey
+// ProbeRequestLedgerKey returns the idempotency ledger key for a probe
+// request. The key is scoped to the lease so that a request key only denotes
+// a retry within the same lease: different leases keep independent ledger
+// entries even when they reuse the same request key.
+func ProbeRequestLedgerKey(leaseID string, input ProbeInput) string {
+	return leaseID + "\x00" + input.RequestKey
 }
 
 func ProbeContentFingerprint(input ProbeInput) string {
@@ -106,6 +110,16 @@ func probeContentFingerprint(
 	return hex.EncodeToString(sum[:])
 }
 
+// EnsureProbeRequestLedger rebuilds the probe request ledger from the probe
+// and lease facts. It is idempotent and runs on every state load so that
+// snapshots written by older builds are repaired:
+//
+//   - shadow probes that were accepted against a lease but only persisted as
+//     ledger claims are promoted to first-class probes;
+//   - reported leases bound to another lease's probe are repointed to the
+//     probe that actually belongs to them;
+//   - the ledger is re-scoped by lease and request key so every observation
+//     has exactly one authoritative entry.
 func EnsureProbeRequestLedger(state *State) {
 	if state == nil {
 		return
@@ -114,47 +128,70 @@ func EnsureProbeRequestLedger(state *State) {
 		state.ProbeRequestLedger = make(map[string]ProbeRequestEntry)
 	}
 
-	claims := make(map[string]struct{})
-	for requestKey, entry := range state.ProbeRequestLedger {
-		entry.RequestKey = requestKey
-		for index := range entry.Claims {
-			claim := entry.Claims[index]
-			if claim.LeaseID == "" {
-				claim.LeaseID = claim.Probe.LeaseID
+	// Promote shadow probes: older builds appended a full probe to a ledger
+	// claim when a second lease reused a request key, but never stored it in
+	// the probe set. The lease was reported and the node released, so the
+	// observation is an accepted fact and must live with the other probes.
+	for _, entry := range state.ProbeRequestLedger {
+		for _, claim := range entry.Claims {
+			probe := claim.Probe
+			if probe.ID == "" {
+				continue
 			}
-			if claim.PlanID == "" {
-				claim.PlanID = claim.Probe.PlanID
+			if _, exists := state.Probes[probe.ID]; exists {
+				continue
 			}
-			if claim.NodeID == "" {
-				claim.NodeID = claim.Probe.NodeID
-			}
-			if claim.Probe.RequestKey == "" {
-				claim.Probe.RequestKey = requestKey
-			}
-			entry.Claims[index] = claim
-			claims[probeClaimKey(claim.LeaseID, claim.Probe.ID)] = struct{}{}
-		}
-		if entry.PrimaryProbeID != "" {
-			primary, ok := state.Probes[entry.PrimaryProbeID]
-			if ok {
-				claimKey := probeClaimKey(primary.LeaseID, primary.ID)
-				if _, exists := claims[claimKey]; !exists {
-					entry.Claims = append(entry.Claims, ProbeRequestClaim{
-						LeaseID: primary.LeaseID,
-						PlanID:  primary.PlanID,
-						NodeID:  primary.NodeID,
-						Probe:   primary,
-					})
-					claims[claimKey] = struct{}{}
+			if lease, ok := state.Leases[probe.LeaseID]; ok {
+				if probe.PlanID == "" {
+					probe.PlanID = lease.PlanID
 				}
-				if entry.ContentFingerprint == "" {
-					entry.ContentFingerprint = ProbeContentFingerprintForProbe(primary)
+				if probe.NodeID == "" {
+					probe.NodeID = lease.NodeID
 				}
 			}
+			if probe.RequestKey == "" {
+				probe.RequestKey = entry.RequestKey
+			}
+			state.Probes[probe.ID] = probe
 		}
-		state.ProbeRequestLedger[requestKey] = entry
 	}
 
+	// Repair lease bindings: a reported lease must reference a probe that
+	// belongs to that lease. Repoint dangling or cross-lease bindings to the
+	// earliest probe stored for the lease, and clear bindings that cannot be
+	// resolved so a lease never points at another lease's result.
+	probesByLease := make(map[string][]Probe)
+	for _, probe := range state.Probes {
+		probesByLease[probe.LeaseID] = append(probesByLease[probe.LeaseID], probe)
+	}
+	for leaseID, lease := range state.Leases {
+		if lease.State != LeaseReported {
+			continue
+		}
+		own := probesByLease[leaseID]
+		sort.Slice(own, func(i, j int) bool {
+			if !own[i].StoredAt.Equal(own[j].StoredAt) {
+				return own[i].StoredAt.Before(own[j].StoredAt)
+			}
+			return own[i].ID < own[j].ID
+		})
+		if lease.ProbeID != "" {
+			probe, ok := state.Probes[lease.ProbeID]
+			if ok && probe.LeaseID == leaseID {
+				continue
+			}
+		}
+		if len(own) > 0 {
+			lease.ProbeID = own[0].ID
+		} else {
+			lease.ProbeID = ""
+		}
+		state.Leases[leaseID] = lease
+	}
+
+	// Rebuild the ledger from the sorted probe facts. Sorting by stored time
+	// then id makes the earliest probe for each (lease, request key) the
+	// primary, matching the replay semantics for new submissions.
 	probes := make([]Probe, 0, len(state.Probes))
 	for _, probe := range state.Probes {
 		probes = append(probes, probe)
@@ -165,35 +202,28 @@ func EnsureProbeRequestLedger(state *State) {
 		}
 		return probes[i].ID < probes[j].ID
 	})
+
+	ledger := make(map[string]ProbeRequestEntry)
 	for _, probe := range probes {
-		requestKey := probe.RequestKey
-		if requestKey == "" {
+		if probe.RequestKey == "" {
 			continue
 		}
-		entry := state.ProbeRequestLedger[requestKey]
-		entry.RequestKey = requestKey
+		key := ProbeRequestLedgerKey(probe.LeaseID, ProbeInput{RequestKey: probe.RequestKey})
+		entry := ledger[key]
+		entry.RequestKey = probe.RequestKey
 		if entry.PrimaryProbeID == "" {
 			entry.PrimaryProbeID = probe.ID
-		}
-		if entry.ContentFingerprint == "" {
 			entry.ContentFingerprint = ProbeContentFingerprintForProbe(probe)
 		}
-		claimKey := probeClaimKey(probe.LeaseID, probe.ID)
-		if _, exists := claims[claimKey]; !exists {
-			entry.Claims = append(entry.Claims, ProbeRequestClaim{
-				LeaseID: probe.LeaseID,
-				PlanID:  probe.PlanID,
-				NodeID:  probe.NodeID,
-				Probe:   probe,
-			})
-			claims[claimKey] = struct{}{}
-		}
-		state.ProbeRequestLedger[requestKey] = entry
+		entry.Claims = append(entry.Claims, ProbeRequestClaim{
+			LeaseID: probe.LeaseID,
+			PlanID:  probe.PlanID,
+			NodeID:  probe.NodeID,
+			Probe:   probe,
+		})
+		ledger[key] = entry
 	}
-}
-
-func probeClaimKey(leaseID string, probeID string) string {
-	return leaseID + "\x00" + probeID
+	state.ProbeRequestLedger = ledger
 }
 
 func BuildAssessment(
